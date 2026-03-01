@@ -1,0 +1,261 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <ESP32Servo.h>
+#include <WiFiManager.h>
+#include "HX711.h"
+
+// --- [Pin Settings] ---
+#define RESET_PIN 0    
+#define TRIG_PIN 25    
+#define ECHO_PIN 26    
+#define SERVO_PIN 13  
+#define RELAY_PIN 18    // ขาควบคุม Relay
+#define LOADCELL_DOUT_PIN 32
+#define LOADCELL_SCK_PIN 33  
+#define LED_BLUE 14     // ไฟสถานะ WiFi
+#define LED_GREEN 27    // ไฟสถานะระบบปกติ
+#define LED_RED 15      // ไฟสถานะอาหารหมด
+
+// --- [User Settings] ---
+const char* serverUrl = "https://smartbot-ai.com/3N/Mini_Project_IoT/api.php";
+const char* myToken = "MY_SECRET_TOKEN";
+const char* telegramToken = "8751733107:AAG1cSxWdfvDEMcaZ8blyubs3FeobnDw2NY";
+const char* chatId = "8579434234";
+
+float calibration_factor = -415.0;
+float foodThreshold = 50.0;      
+float waterThresholdPct = 10.0; // จุดเริ่มเติมน้ำ (%)
+float stopWaterPct = 30.0;      // จุดหยุดเติมน้ำ (%)
+
+const float WATER_EMPTY_CM = 11.50;  
+const float WATER_FULL_CM = 6.43;   
+
+// --- [Global Variables] ---
+Servo feederServo;
+HX711 scale;
+unsigned long lastUpdate = 0;
+unsigned long lastCheckCommand = 0;
+const int updateInterval = 30000;  
+const int checkInterval = 5000;    
+bool waterFilling = false;
+bool foodAlertSent = false;
+float currentDistanceCM = 0;
+
+// --- [Function Prototypes] ---
+String urlEncode(String str);
+void sendTelegram(String message);
+void checkWebCommand();
+void feedNow();
+void waterNow();
+void sendDataToDashboard(float food, float water, String type);
+float readWaterPercent();
+void showSerialMonitor(float food, float waterPct, float waterCM);
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(RESET_PIN, INPUT_PULLUP);
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(RELAY_PIN, OUTPUT);
+  pinMode(LED_BLUE, OUTPUT);
+  pinMode(LED_GREEN, OUTPUT);
+  pinMode(LED_RED, OUTPUT);
+
+  digitalWrite(RELAY_PIN, LOW);
+  digitalWrite(LED_BLUE, LOW);
+  digitalWrite(LED_GREEN, LOW);
+  digitalWrite(LED_RED, LOW);
+
+  scale.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
+  scale.set_scale(calibration_factor);
+  scale.tare();
+
+  ESP32PWM::allocateTimer(1);
+  feederServo.setPeriodHertz(50);
+  feederServo.attach(SERVO_PIN, 500, 2400);
+  feederServo.write(0);
+
+  WiFiManager wm;
+  Serial.println("Connecting WiFi...");
+  if (!wm.autoConnect("SmartPetFeeder_AP")) {
+    delay(3000);
+    ESP.restart();
+  }
+
+  for(int i=0; i<5; i++) {
+    digitalWrite(LED_BLUE, HIGH); delay(100);
+    digitalWrite(LED_BLUE, LOW); delay(100);
+  }
+ 
+  digitalWrite(LED_BLUE, LOW);   
+  digitalWrite(LED_GREEN, HIGH); 
+  Serial.println("\n--- SYSTEM READY ---");
+}
+
+void loop() {
+  // 1. อ่านค่าเซนเซอร์
+  float foodWeight = scale.get_units(3);
+  if (foodWeight < 0) foodWeight = 0;
+  float waterPct = readWaterPercent();
+
+  showSerialMonitor(foodWeight, waterPct, currentDistanceCM);
+
+  // --- [จุดแก้ไขหลัก: ระบบจัดการน้ำแบบ Force Stop] ---
+  if (waterPct >= stopWaterPct) {
+    if (digitalRead(RELAY_PIN) == HIGH || waterFilling == true) { 
+      digitalWrite(RELAY_PIN, LOW); // สั่งตัดไฟ Relay ทันที
+      waterFilling = false;
+      Serial.println(">>> ACTION: Water Stop (Reached Limit) <<<");
+    }
+  } 
+  else if (waterPct < waterThresholdPct && waterPct >= 0) {
+    if (!waterFilling) {
+      digitalWrite(RELAY_PIN, HIGH); // เริ่มปั๊ม
+      waterFilling = true;
+      sendTelegram("💧 ระดับน้ำต่ำเหลือ " + String(waterPct, 1) + "% กำลังเติมน้ำ...");
+      sendDataToDashboard(foodWeight, waterPct, "water");
+    }
+  }
+
+  // --- [จุดแก้ไขหลัก: ระบบจัดการอาหารแบบ One-time Write] ---
+// --- [ระบบจัดการอาหาร: เพิ่มเงื่อนไข Block เมื่อเติมน้ำ] ---
+  // เพิ่ม !waterFilling เพื่อเช็คว่าต้องไม่อยู่ในสถานะเติมน้ำเท่านั้นถึงจะจ่ายอาหารได้
+  if (foodWeight < foodThreshold && !waterFilling) { 
+    digitalWrite(LED_RED, HIGH); 
+    if (!foodAlertSent) {
+      feederServo.write(90); // เปิดฝา
+      sendTelegram("⚠️ อาหารเหลือน้อย! (" + String(foodWeight, 1) + " g)");
+      sendDataToDashboard(foodWeight, waterPct, "feed"); 
+      foodAlertSent = true;
+    }
+  } else {
+    // ถ้าอาหารเต็ม หรือ "กำลังเติมน้ำอยู่" ให้ปิดฝาไว้ก่อนเพื่อความปลอดภัย
+    if (foodWeight >= foodThreshold || waterFilling) {
+      digitalWrite(LED_RED, LOW);  
+      if (foodAlertSent) {
+        feederServo.write(0); // ปิดฝา
+        foodAlertSent = false;
+      }
+    }
+  }
+
+  // 4. เช็คคำสั่งจาก Dashboard
+  if (millis() - lastCheckCommand > checkInterval) {
+    checkWebCommand();
+    lastCheckCommand = millis();
+  }
+
+  // 5. ส่ง Monitor ขึ้น Dashboard ทุก 30 วินาที
+  if (millis() - lastUpdate > updateInterval) {
+    sendDataToDashboard(foodWeight, waterPct, "monitor");
+    lastUpdate = millis();
+  }
+
+  // 6. ไฟสถานะ WiFi
+  if (WiFi.status() != WL_CONNECTED) digitalWrite(LED_BLUE, HIGH);
+  else digitalWrite(LED_BLUE, LOW);
+
+  delay(200);
+}
+
+// --- [Functions] ---
+
+float readWaterPercent() {
+  const int numSamples = 7;
+  float samples[numSamples];
+  int validCount = 0;
+  for (int i = 0; i < numSamples; i++) {
+    digitalWrite(TRIG_PIN, LOW); delayMicroseconds(2);
+    digitalWrite(TRIG_PIN, HIGH); delayMicroseconds(10);
+    digitalWrite(TRIG_PIN, LOW);
+    long duration = pulseIn(ECHO_PIN, HIGH, 25000);
+    if (duration > 0) {
+      samples[validCount] = duration * 0.034 / 2;
+      validCount++;
+    }
+    delay(15);
+  }
+  if (validCount == 0) return 0;
+  for (int i = 0; i < validCount - 1; i++) {
+    for (int j = i + 1; j < validCount; j++) {
+      if (samples[i] > samples[j]) {
+        float temp = samples[i]; samples[i] = samples[j]; samples[j] = temp;
+      }
+    }
+  }
+  currentDistanceCM = samples[validCount / 2];
+  float pct = (WATER_EMPTY_CM - currentDistanceCM) * 100.0 / (WATER_EMPTY_CM - WATER_FULL_CM);
+  if (pct < 0) pct = 0;
+  if (pct > 100) pct = 100;
+  return pct;
+}
+
+void showSerialMonitor(float food, float waterPct, float waterCM) {
+  Serial.print("🍲 Food: "); Serial.print(food); Serial.print(" g | ");
+  Serial.print("💧 Water: "); Serial.print(waterPct, 1); Serial.print(" % (");
+  Serial.print(waterCM, 2); Serial.println(" cm)");
+}
+
+void feedNow() {
+  feederServo.write(90); delay(2000); feederServo.write(0);
+  sendDataToDashboard(scale.get_units(3), readWaterPercent(), "feed");
+}
+
+void waterNow() {
+  digitalWrite(RELAY_PIN, HIGH); delay(3000); digitalWrite(RELAY_PIN, LOW);
+  sendDataToDashboard(scale.get_units(3), readWaterPercent(), "water");
+}
+
+void checkWebCommand() {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    http.begin(String(serverUrl) + "?check_command=1");
+    int httpCode = http.GET();
+    if (httpCode > 0) {
+      String payload = http.getString();
+      payload.trim();
+      if (payload == "feed") feedNow();
+      else if (payload == "water") waterNow();
+    }
+    http.end();
+  }
+}
+
+void sendDataToDashboard(float food, float water, String type) {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    http.begin(serverUrl);
+    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+    String payload = "food=" + String(food) + "&water=" + String(water) + "&type=" + type + "&token=" + String(myToken);
+    http.POST(payload);
+    http.end();
+  }
+}
+
+void sendTelegram(String message) {
+  if (WiFi.status() == WL_CONNECTED) {
+    WiFiClientSecure client;
+    client.setInsecure();
+    HTTPClient http;
+    String url = "https://api.telegram.org/bot" + String(telegramToken) + "/sendMessage?chat_id=" + String(chatId) + "&text=" + urlEncode(message);
+    http.begin(client, url);
+    http.GET();
+    http.end();
+  }
+}
+
+String urlEncode(String str) {
+  String encodedString = "";
+  for (int i = 0; i < str.length(); i++) {
+    char c = str.charAt(i);
+    if (isalnum(c)) encodedString += c;
+    else if (c == ' ') encodedString += "%20";
+    else {
+      encodedString += '%';
+      char buf[3]; sprintf(buf, "%02X", (unsigned char)c);
+      encodedString += buf;
+    }
+  }
+  return encodedString;
+}
